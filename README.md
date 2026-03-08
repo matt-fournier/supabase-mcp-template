@@ -509,6 +509,74 @@ verify_jwt = false
 supabase functions deploy mcp-server --no-verify-jwt
 ```
 
+### Production deployment — step by step
+
+Concrete recipe for deploying authentication to production on a new MCP function:
+
+**Step 1 — Generate an API key:**
+
+```bash
+openssl rand -hex 32
+# Result: a1b2c3d4e5f6...
+# Full key: mcp_sk_a1b2c3d4e5f6...
+```
+
+The `mcp_sk_` prefix allows the auth module to distinguish an API key from a Supabase JWT and route to the correct validation strategy.
+
+**Step 2 — Register the key in Supabase secrets:**
+
+```bash
+supabase secrets set MCP_API_KEYS="claude-desktop:mcp_sk_a1b2c3d4e5f6..."
+```
+
+The `name:key` format identifies each client in logs and allows per-key revocation. Multiple keys are comma-separated.
+
+**Step 3 — Disable `verify_jwt` at the gateway:**
+
+In `supabase/config.toml`:
+
+```toml
+[functions.mcp-server]
+verify_jwt = false
+```
+
+The Supabase gateway is incompatible with the new asymmetric signing keys (post-2025). Authentication is handled entirely inside the function code, following the [pattern recommended by Supabase](https://supabase.com/docs/guides/functions/auth).
+
+**Step 4 — Configure the import map for `_shared`:**
+
+The Supabase bundler does not automatically resolve paths to `_shared/` at deploy time. Create `supabase/functions/deno.json`:
+
+```json
+{
+  "imports": {
+    "@shared/": "./_shared/"
+  }
+}
+```
+
+All imports then use `@shared/mcp-auth/mod.ts` instead of relative paths.
+
+**Step 5 — Deploy:**
+
+```bash
+supabase functions deploy mcp-server --no-verify-jwt
+```
+
+**Step 6 — Validate:**
+
+```bash
+curl -X POST https://<project-ref>.supabase.co/functions/v1/mcp-server \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer mcp_sk_YOUR_KEY" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+A successful response returns the list of available tools, confirming that API key authentication works in production.
+
+**Step 7 — Configure clients:**
+
+For Claude Desktop, use `npx mcp-remote` as a proxy since Claude Desktop does not natively support remote HTTP MCP servers. For Cowork, the MCP connects directly via the built-in connector. For web applications, pass the Supabase `session.access_token` as a Bearer token.
+
 ### Authorization Patterns
 
 **1. Always scope database queries to the authenticated user:**
