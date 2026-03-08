@@ -69,6 +69,13 @@ The edge function acts as a **stateless MCP server**. Each request is fully self
 ```
 supabase/
 ├── functions/
+│   ├── deno.json             # Import map: @shared/ → ./_shared/
+│   ├── _shared/
+│   │   └── mcp-auth/
+│   │       ├── mod.ts        # Entry point — authenticate(req)
+│   │       ├── api-key.ts    # Strategy: API key (mcp_sk_...)
+│   │       ├── supabase-jwt.ts # Strategy: Supabase JWT (getClaims/getUser)
+│   │       └── types.ts      # AuthIdentity, AuthResult
 │   └── mcp-server/
 │       ├── index.ts          # Entry point — handles HTTP and routes to MCP
 │       ├── server.ts         # MCP server definition and tool registration
@@ -76,7 +83,7 @@ supabase/
 │       │   ├── index.ts      # Re-exports all tools
 │       │   ├── query.ts      # Example: database query tool
 │       │   └── storage.ts    # Example: storage tool
-│       ├── auth.ts           # Authentication helpers
+│       ├── auth.ts           # Re-export from @shared/mcp-auth
 │       ├── cors.ts           # CORS headers
 │       └── types.ts          # Shared types
 ├── .env.local                # Local secrets (never commit)
@@ -92,28 +99,27 @@ supabase/
 ### `index.ts` — Entry Point
 
 ```typescript
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { corsHeaders, handleCors } from "./cors.ts";
 import { authenticate } from "./auth.ts";
 import { createMcpServer } from "./server.ts";
 
-serve(async (req: Request) => {
+Deno.serve(async (req: Request) => {
   // Handle CORS preflight
   const corsResponse = handleCors(req);
   if (corsResponse) return corsResponse;
 
   try {
-    // Authenticate every request
-    const user = await authenticate(req);
-    if (!user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
+    // Authenticate every request (see Section 6)
+    const result = await authenticate(req);
+    if (!result.success) {
+      return new Response(JSON.stringify({ error: result.error }), {
+        status: result.status,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     // Route to MCP handler
-    const server = createMcpServer(user);
+    const server = createMcpServer(result.identity);
     return await server.handle(req);
 
   } catch (error) {
@@ -299,43 +305,218 @@ The description is the most important part of a tool. Write it as if you're expl
 
 ## 6. Authentication & Authorization
 
-### `auth.ts` — Supabase JWT Validation
+### Architecture overview
+
+Authentication is centralized in a shared module (`_shared/mcp-auth/`) imported by all MCP functions. The Supabase gateway does **not** verify JWTs (`verify_jwt = false`) — validation is handled entirely inside the function code. This is required because Supabase's gateway JWT verification is incompatible with the new asymmetric signing keys (post-2025).
+
+**References:**
+- [Securing Edge Functions](https://supabase.com/docs/guides/functions/auth)
+- [JWT Signing Keys](https://supabase.com/docs/guides/auth/signing-keys)
+- [Deploy MCP Servers](https://supabase.com/docs/guides/getting-started/byo-mcp)
+
+### File structure
+
+```
+supabase/functions/
+├── deno.json                  # Import map: @shared/ → ./_shared/
+├── _shared/
+│   └── mcp-auth/
+│       ├── mod.ts             # Entry point — authenticate(req)
+│       ├── api-key.ts         # Strategy: API key (mcp_sk_...)
+│       ├── supabase-jwt.ts    # Strategy: Supabase JWT (getClaims/getUser)
+│       └── types.ts           # AuthIdentity, AuthResult
+├── mcp-server/
+│   ├── auth.ts                # Re-export from @shared/mcp-auth
+│   └── ...
+```
+
+### Import map (`deno.json`)
+
+The `_shared/` folder is not automatically resolved by the Supabase bundler at deploy time. An alias in `supabase/functions/deno.json` solves this:
+
+```json
+{
+  "imports": {
+    "@shared/": "./_shared/"
+  }
+}
+```
+
+### Authentication flow
+
+```
+Incoming HTTP request
+        │
+        ▼
+┌─ SKIP_AUTH=true ? ──────────────────────── Yes ─── Return DEV_IDENTITY (local dev)
+│       │
+│      No
+│       │
+│       ▼
+│  Authorization header present?
+│       │
+│      No ───────────────────────────────── 401 "Missing Authorization header"
+│       │
+│      Yes
+│       │
+│       ▼
+│  Extract Bearer token
+│       │
+│       ▼
+│  Token starts with mcp_sk_ ?
+│       │
+│      Yes ──── validateApiKey() ─────────── Check against MCP_API_KEYS
+│       │                                         │
+│      No                                   Found? ── Yes ── AuthIdentity (method: api_key)
+│       │                                         │
+│       │                                        No ── 401 "Invalid API key"
+│       ▼
+│  validateSupabaseJwt()
+│       │
+│       ▼
+│  getClaims(token) available?
+│       │
+│      Yes ──── Try getClaims() ──── Success? ── AuthIdentity (method: supabase_jwt)
+│       │                                │
+│       │                              Fail ── Fallback to getUser()
+│      No
+│       │
+│       ▼
+│  getUser(token) ────────────────────── Success? ── AuthIdentity (method: supabase_jwt)
+│                                            │
+│                                          Fail ── 401 "Invalid or expired JWT"
+```
+
+### Types
 
 ```typescript
-import { createClient } from "npm:@supabase/supabase-js";
-import type { AuthUser } from "./types.ts";
-
-export async function authenticate(req: Request): Promise<AuthUser | null> {
-  const authHeader = req.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return null;
-
-  const token = authHeader.split(" ")[1];
-
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_ANON_KEY")!
-  );
-
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-
-  if (error || !user) return null;
-
-  return {
-    id: user.id,
-    email: user.email!,
-    role: user.role ?? "user",
-  };
+/** Authenticated identity returned by the middleware. */
+export interface AuthIdentity {
+  id: string;
+  email: string;
+  role: string;
+  method: "api_key" | "supabase_jwt" | "skip_auth";
 }
+
+/** Result of an authentication attempt. */
+export type AuthResult =
+  | { success: true; identity: AuthIdentity }
+  | { success: false; error: string; status: number };
+```
+
+### Method 1 — SKIP_AUTH (local development only)
+
+For rapid local development without any authentication:
+
+```bash
+# .env.local
+SKIP_AUTH=true
+```
+
+Returns a fixed dev identity. The code emits a `console.warn` to flag that auth is disabled. **Never enable in production.**
+
+### Method 2 — API Key (machine-to-machine)
+
+For Claude Desktop, Cowork, server scripts, backend integrations — any client that cannot interactively refresh a JWT.
+
+**Token format:** `mcp_sk_` followed by a random string (recommended: 64 hex characters).
+
+```
+Authorization: Bearer mcp_sk_a1b2c3d4e5f6...
+```
+
+**Secret configuration:** The `MCP_API_KEYS` secret contains comma-separated `name:key` pairs:
+
+```
+MCP_API_KEYS="claude-desktop:mcp_sk_abc123,backend-app:mcp_sk_xyz789"
+```
+
+The name identifies which client made the request (useful for logs and per-key revocation).
+
+**Generate a key:**
+
+```bash
+openssl rand -hex 32
+# Result: a1b2c3d4e5f6...
+# Full key: mcp_sk_a1b2c3d4e5f6...
+```
+
+**Key rotation** (zero-downtime):
+1. Generate a new key
+2. Add the new key to `MCP_API_KEYS` (keep the old one temporarily)
+3. Update the client to use the new key
+4. Remove the old key from `MCP_API_KEYS`
+
+### Method 3 — Supabase JWT (web users)
+
+For web applications where users log in via Supabase Auth (email/password, OAuth, Magic Link, etc.).
+
+```
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+```
+
+**Required secrets:**
+
+| Secret | Description | Auto-injected? |
+|---|---|---|
+| `SUPABASE_URL` | Supabase project URL | Yes |
+| `SB_PUBLISHABLE_KEY` | New publishable key (post-May 2025 projects) | No — must be set manually |
+| `SUPABASE_ANON_KEY` | Legacy anon key | Yes |
+
+**Validation strategy (cascade):**
+
+1. **`getClaims(token)`** — New method (Supabase JS v2+). Verifies the JWT locally with asymmetric keys. Fast, rarely needs the network.
+2. **`getUser(token)`** — Legacy fallback. Makes a network call to the Auth server. Slower but compatible with all projects.
+
+### Integrating in a new MCP function
+
+**1. Create `auth.ts` in your function folder (re-export):**
+
+```typescript
+export { authenticate } from "@shared/mcp-auth/mod.ts";
+export type { AuthIdentity, AuthResult } from "@shared/mcp-auth/mod.ts";
+```
+
+**2. Call `authenticate(req)` in `index.ts`:**
+
+```typescript
+import { authenticate } from "./auth.ts";
+
+Deno.serve(async (req: Request) => {
+  const result = await authenticate(req);
+  if (!result.success) {
+    return new Response(JSON.stringify({ error: result.error }), {
+      status: result.status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const identity = result.identity;
+  // ... MCP logic with identity
+});
+```
+
+**3. Set `verify_jwt = false` in `config.toml`:**
+
+```toml
+[functions.mcp-server]
+verify_jwt = false
+```
+
+**4. Deploy with `--no-verify-jwt`:**
+
+```bash
+supabase functions deploy mcp-server --no-verify-jwt
 ```
 
 ### Authorization Patterns
 
 **1. Always scope database queries to the authenticated user:**
 ```typescript
-supabase.from("projects").select("*").eq("user_id", user.id)
+supabase.from("projects").select("*").eq("user_id", identity.id)
 ```
 
-**2. Use Supabase Row Level Security (RLS) as a safety net:**  
+**2. Use Supabase Row Level Security (RLS) as a safety net:**
 Even if your tool code is correct, RLS prevents data leaks if something goes wrong. Enable RLS on every table and define policies.
 
 ```sql
@@ -348,7 +529,7 @@ CREATE POLICY "Users can only access their own records"
 **3. Role-based tool access:**
 ```typescript
 server.tool("admin_export_all", "...", {}, async () => {
-  if (user.role !== "admin") {
+  if (identity.role !== "admin") {
     return {
       content: [{ type: "text", text: "Access denied: admin role required." }],
       isError: true,
@@ -358,17 +539,73 @@ server.tool("admin_export_all", "...", {}, async () => {
 });
 ```
 
-**4. API key authentication (for non-Supabase clients):**
+### Client configuration examples
 
-If your MCP is called by external systems rather than Supabase users, validate a shared secret:
+**Claude Desktop / Cowork:**
 
-```typescript
-export async function authenticateApiKey(req: Request): Promise<boolean> {
-  const key = req.headers.get("x-api-key");
-  const validKey = Deno.env.get("MCP_API_KEY");
-  return key === validKey;
+```json
+{
+  "mcpServers": {
+    "my-mcp": {
+      "type": "http",
+      "url": "https://<project-ref>.supabase.co/functions/v1/mcp-server",
+      "headers": {
+        "Authorization": "Bearer mcp_sk_YOUR_KEY"
+      }
+    }
+  }
 }
 ```
+
+**Web application (Supabase Auth):**
+
+```typescript
+const { data: { session } } = await supabase.auth.getSession();
+
+const response = await fetch(
+  "https://<project-ref>.supabase.co/functions/v1/mcp-server",
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "list_my_projects", arguments: {} },
+    }),
+  }
+);
+```
+
+**Server script (curl):**
+
+```bash
+curl -X POST https://<project-ref>.supabase.co/functions/v1/mcp-server \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer mcp_sk_YOUR_KEY" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Solution |
+|---|---|---|
+| `401 "Missing or malformed Authorization header"` | No `Authorization: Bearer ...` header | Add the header with the correct token |
+| `401 "Invalid API key"` | `mcp_sk_...` key not found in `MCP_API_KEYS` | Check the secret with `supabase secrets list` |
+| `401 "Invalid or expired JWT"` | Expired or invalid Supabase JWT | Refresh the token client-side |
+| `500 "API key authentication is not configured"` | `MCP_API_KEYS` secret missing | `supabase secrets set MCP_API_KEYS=...` |
+| `500 "Supabase JWT authentication is not configured"` | Missing `SB_PUBLISHABLE_KEY` and `SUPABASE_ANON_KEY` | Expose the publishable key as a secret |
+| `{"msg":"Missing authorization header"}` (before function) | `verify_jwt` still enabled at gateway | Redeploy with `--no-verify-jwt` |
+
+### Security rules
+
+- **Never enable `SKIP_AUTH` in production.**
+- **Never expose `mcp_sk_...` keys client-side** (browser, public source code).
+- **Always deploy with `--no-verify-jwt`** — the Supabase gateway is incompatible with the new key model and the MCP pattern.
+- **Use HTTPS** for all production communication (Supabase provides it by default).
 
 ---
 
@@ -383,16 +620,26 @@ SUPABASE_ANON_KEY
 SUPABASE_SERVICE_ROLE_KEY
 SUPABASE_DB_URL
 
+# Auth — API keys for machine-to-machine clients (see Section 6)
+MCP_API_KEYS=claude-desktop:mcp_sk_XXXX,cowork:mcp_sk_YYYY
+
+# Auth — Supabase publishable key for JWT validation (post-May 2025 projects)
+SB_PUBLISHABLE_KEY=sb_publishable_XXXX
+
 # Your custom secrets
-MCP_API_KEY=your-secret-key
 EXTERNAL_SERVICE_API_KEY=...
 ```
 
 ### Setting Secrets
 
 ```bash
-# Set secrets for production
-supabase secrets set MCP_API_KEY=your-secret-key
+# API keys for machine-to-machine clients
+supabase secrets set MCP_API_KEYS="claude-desktop:mcp_sk_XXXX,cowork:mcp_sk_YYYY"
+
+# Supabase publishable key (for JWT validation with new asymmetric keys)
+supabase secrets set SB_PUBLISHABLE_KEY=sb_publishable_XXXX
+
+# Your custom secrets
 supabase secrets set EXTERNAL_API_KEY=abc123
 
 # List all secrets (values hidden)
@@ -404,7 +651,13 @@ supabase secrets list
 Create `supabase/.env.local` (never commit this file):
 
 ```
-MCP_API_KEY=local-dev-key
+# Skip auth entirely for local dev (never use in production)
+SKIP_AUTH=true
+
+# Or test with API key auth:
+# SKIP_AUTH=false
+# MCP_API_KEYS=dev-test:mcp_sk_test123
+
 EXTERNAL_API_KEY=test-key
 ```
 
@@ -693,8 +946,8 @@ Deno.test("query_records returns data for valid user", async () => {
 ### Deploy the Function
 
 ```bash
-# Deploy a single function
-supabase functions deploy mcp-server
+# Deploy a single function (--no-verify-jwt is required for MCP auth — see Section 6)
+supabase functions deploy mcp-server --no-verify-jwt
 
 # Deploy all functions
 supabase functions deploy
@@ -703,7 +956,11 @@ supabase functions deploy
 ### Set Production Secrets
 
 ```bash
-supabase secrets set MCP_API_KEY=prod-secret-key
+# Auth secrets (see Section 6)
+supabase secrets set MCP_API_KEYS="claude-desktop:mcp_sk_XXXX,cowork:mcp_sk_YYYY"
+supabase secrets set SB_PUBLISHABLE_KEY=sb_publishable_XXXX
+
+# Your custom secrets
 supabase secrets set EXTERNAL_API_KEY=prod-api-key
 ```
 
@@ -779,6 +1036,9 @@ console.log(data.session?.access_token);
 Before going to production, verify:
 
 - [ ] **Authentication is enforced on every request** — no tool is accessible without a valid token
+- [ ] **`SKIP_AUTH` is disabled** in production (never set `SKIP_AUTH=true` outside local dev)
+- [ ] **`verify_jwt = false`** is set in `config.toml` and deployed with `--no-verify-jwt`
+- [ ] **API keys (`mcp_sk_...`) are never exposed client-side** — only used by server/desktop clients
 - [ ] **RLS is enabled** on every Supabase table touched by your tools
 - [ ] **Service role key is never exposed** to the client — only used server-side
 - [ ] **Input validation** is done via Zod schemas on all tool arguments
@@ -877,11 +1137,11 @@ A minimal but complete MCP server with one tool:
 
 ```typescript
 // supabase/functions/mcp-server/index.ts
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { McpServer } from "npm:@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "npm:@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createClient } from "npm:@supabase/supabase-js";
 import { z } from "npm:zod";
+import { authenticate } from "./auth.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "https://claude.ai",
@@ -889,27 +1149,22 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-serve(async (req: Request) => {
+Deno.serve(async (req: Request) => {
   // CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
-  // Auth
-  const token = req.headers.get("Authorization")?.split(" ")[1];
-  if (!token) {
-    return new Response("Unauthorized", { status: 401, headers: corsHeaders });
+  // Auth (supports API keys, Supabase JWT, and SKIP_AUTH for local dev)
+  const result = await authenticate(req);
+  if (!result.success) {
+    return new Response(JSON.stringify({ error: result.error }), {
+      status: result.status,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_ANON_KEY")!
-  );
-
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) {
-    return new Response("Unauthorized", { status: 401, headers: corsHeaders });
-  }
+  const identity = result.identity;
 
   // MCP Server
   const server = new McpServer({ name: "minimal-mcp", version: "1.0.0" });
@@ -927,7 +1182,7 @@ serve(async (req: Request) => {
       const { data, error } = await adminClient
         .from("projects")
         .select("id, name, status")
-        .eq("user_id", user.id)
+        .eq("user_id", identity.id)
         .limit(limit);
 
       if (error) {
