@@ -542,19 +542,19 @@ verify_jwt = false
 
 The Supabase gateway is incompatible with the new asymmetric signing keys (post-2025). Authentication is handled entirely inside the function code, following the [pattern recommended by Supabase](https://supabase.com/docs/guides/functions/auth).
 
-**Step 4 — Configure the import map for `_shared`:**
+**Step 4 — Use relative imports for `_shared`:**
 
-The Supabase bundler does not automatically resolve paths to `_shared/` at deploy time. Create `supabase/functions/deno.json`:
+The Supabase bundler does not reliably resolve the `@shared/` import map at deploy time. Use **relative paths** in your function code:
 
-```json
-{
-  "imports": {
-    "@shared/": "./_shared/"
-  }
-}
+```typescript
+// ✅ Relative import — works with Supabase deploy bundler
+import { authenticate } from "../_shared/mcp-auth/mod.ts";
+
+// ❌ Import map alias — may fail during supabase functions deploy
+import { authenticate } from "@shared/mcp-auth/mod.ts";
 ```
 
-All imports then use `@shared/mcp-auth/mod.ts` instead of relative paths.
+> **Note:** A `deno.json` with `@shared/` mapping can still be used for local development and IDE support, but production deploys require relative paths.
 
 **Step 5 — Deploy:**
 
@@ -567,15 +567,16 @@ supabase functions deploy mcp-server --no-verify-jwt
 ```bash
 curl -X POST https://<project-ref>.supabase.co/functions/v1/mcp-server \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -H "Authorization: Bearer mcp_sk_YOUR_KEY" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
-A successful response returns the list of available tools, confirming that API key authentication works in production.
+A successful response contains `serverInfo` with your server name and version, confirming that API key authentication works in production.
 
 **Step 7 — Configure clients:**
 
-For Claude Desktop, use `npx mcp-remote` as a proxy since Claude Desktop does not natively support remote HTTP MCP servers. For Cowork, the MCP connects directly via the built-in connector. For web applications, pass the Supabase `session.access_token` as a Bearer token.
+For Claude Desktop / Cowork, use `npx supergateway` as a stdio ↔ Streamable HTTP proxy (see client configuration examples below). **Do not use `mcp-remote`** — it performs mandatory OAuth discovery that is incompatible with Supabase Edge Functions. For web applications, pass the Supabase `session.access_token` as a Bearer token.
 
 ### Authorization Patterns
 
@@ -611,19 +612,27 @@ server.tool("admin_export_all", "...", {}, async () => {
 
 **Claude Desktop / Cowork:**
 
+Use `supergateway` to bridge stdio ↔ Streamable HTTP. Claude Desktop does not natively support remote URLs in `claude_desktop_config.json`.
+
 ```json
 {
   "mcpServers": {
     "my-mcp": {
-      "type": "http",
-      "url": "https://<project-ref>.supabase.co/functions/v1/mcp-server",
-      "headers": {
-        "Authorization": "Bearer mcp_sk_YOUR_KEY"
-      }
+      "command": "npx",
+      "args": [
+        "-y",
+        "supergateway",
+        "--streamableHttp",
+        "https://<project-ref>.supabase.co/functions/v1/mcp-server",
+        "--header",
+        "Authorization: Bearer mcp_sk_YOUR_KEY"
+      ]
     }
   }
 }
 ```
+
+> **Warning:** Do not use `mcp-remote` — it performs mandatory OAuth discovery (`registerClient`) before connecting, which fails against Supabase Edge Functions with a `ServerError`. Use `supergateway` instead, which connects directly via Streamable HTTP with the provided headers.
 
 **Web application (Supabase Auth):**
 
